@@ -20,22 +20,22 @@ static void print_blockgroup(const struct ext2_group_desc *group, int verbose)
 	if (verbose)
 	{
 		printf("Block group:\n");
-		printf("    block bitmap: %d\n", /* TODO */);
-		printf("    inode bitmap: %d\n", /* TODO */);
-		printf("    inode table: %d\n", /* TODO */);
-		printf("    free blocks: %d\n", /* TODO */);
-		printf("    free inodes: %d\n", /* TODO */);
-		printf("    used_dirs: %d\n", /* TODO */);
+		printf("    block bitmap: %d\n", group->bg_block_bitmap);
+		printf("    inode bitmap: %d\n", group->bg_inode_bitmap);
+		printf("    inode table: %d\n", group->bg_inode_table);
+		printf("    free blocks: %d\n", group->bg_free_blocks_count);
+		printf("    free inodes: %d\n", group->bg_free_inodes_count);
+		printf("    used_dirs: %d\n", group->bg_used_dirs_count);
 	}
 	else
 	{
 		printf("%d, %d, %d, %d, %d, %d\n",
-			   /* TODO */,
-			   /* TODO */,
-			   /* TODO */,
-			   /* TODO */,
-			   /* TODO */,
-			   /* TODO */);
+			   group->bg_block_bitmap,
+			   group->bg_inode_bitmap,
+			   group->bg_inode_table,
+			   group->bg_free_blocks_count,
+			   group->bg_free_inodes_count,
+			   group->bg_used_dirs_count);
 	}
 }
 
@@ -45,6 +45,17 @@ void print_usage()
 	fprintf(stderr, "     -t will print the output in terse format for auto-testing\n");
 	fprintf(stderr, "     -v will print the output in verbose format for easy viewing\n");
 }
+
+void print_binary(const unsigned char *ptr, int number_bytes){
+		unsigned char byte;
+		for(int i = 0; i < number_bytes; i++){
+			byte = *(ptr + i);
+			for(int j = 0; j < 8; j++){
+				printf("%d", (byte & (1 << j)) >> j);
+			}
+			printf(" ");
+		}
+	}
 
 int main(int argc, char *argv[])
 {
@@ -102,7 +113,77 @@ int main(int argc, char *argv[])
 	const struct ext2_group_desc *group = (const struct ext2_group_desc *)(disk + EXT2_BLOCK_SIZE * 2);
 	print_blockgroup(group, verbose);
 
-	/*TODO*/
+	const unsigned char *block_bitmap = disk + EXT2_BLOCK_SIZE * (group->bg_block_bitmap);
+    const unsigned char *inode_bitmap = disk + EXT2_BLOCK_SIZE * (group->bg_inode_bitmap);
+    
+	if(verbose)
+	{
+		printf("Block bitmap: ");
+		print_binary(block_bitmap, (sb->s_blocks_count)/8);
+		printf("\n");
+		printf("Inode bitmap: ");
+		print_binary(inode_bitmap, (sb->s_inodes_count)/8);
+	}
+	else
+	{
+		print_binary(block_bitmap, (sb->s_blocks_count)/8);
+		printf("\n");
+		print_binary(inode_bitmap, (sb->s_inodes_count)/8);
+	}
+
+	if(verbose){
+		printf("\n\nInodes:");
+	}
+
+	const unsigned char *inode_table = disk + EXT2_BLOCK_SIZE * (group->bg_inode_table); 
+	const struct ext2_inode *root_inode = (const struct ext2_inode *)(inode_table + sb->s_inode_size);
+
+	void print_inode_pointers(const unsigned int *i_block, int i_blocks){
+		int num_pointers = i_blocks > 24 ? 13 : (i_blocks +1)/2;
+		for(int i = 0; i < num_pointers; i ++){
+			printf(" %d", (int)(i_block[i]));
+		}
+	}
+
+	void print_inode(const struct ext2_inode *inode, int index, int verbose){
+		
+		char filetype = (inode->i_mode & EXT2_S_IFREG ) == EXT2_S_IFREG ? 'f': 'd';
+		if(verbose){
+			printf("\n[%d] type: %c size: %d links: %d blocks: %d", 
+					index, 
+					filetype,
+					inode->i_size,
+					inode->i_links_count,
+					inode->i_blocks);
+			printf("\n[%d] Blocks:", index);
+		}else{
+			printf("\n[%d] %c, %d, %d, %d | ", 
+					index, 
+					filetype,
+					inode->i_size,
+					inode->i_links_count,
+					inode->i_blocks);
+		}
+		print_inode_pointers(inode->i_block, inode->i_blocks);
+		
+		
+	}
+	print_inode(root_inode, 1, verbose);
+
+	int in_use(const unsigned char *inode_bitmap, int index){
+		unsigned char byte = *(inode_bitmap + index/8);
+		if(byte & (1 << (index % 8))){
+			return 1;
+		}
+		return 0;
+	}
+
+	for(int index = 11; index < sb->s_inodes_count; index++){
+		if(in_use(inode_bitmap, index)){
+			print_inode((const struct ext2_inode *)(inode_table + index*sb->s_inode_size), index, verbose);
+		}
+	}
+
 
 	return 0;
 }

@@ -45,6 +45,7 @@ static int passthrough_statfs(const char *path, struct statvfs *st)
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "statfs(%s, %p)\n", path, (void *)st);
 	return statvfs(abs_path, st) < 0 ? -errno : 0;
 }
 
@@ -58,6 +59,7 @@ static int passthrough_getattr(const char *path, struct stat *st)
 
 	//NOTE: using lstat() instead of stat() since FUSE doesn't expect this
 	//      function to follow symlinks
+	fprintf(stderr, "getattr(%s, %p)\n", path, (void *)st);
 	return lstat(abs_path, st) < 0 ? -errno : 0;
 }
 
@@ -84,6 +86,7 @@ static int passthrough_readdir(const char *path, void *buf, fuse_fill_dir_t fill
 	}
 
 	closedir(dir);
+	fprintf(stderr, "readdir(%s, %p)\n", path, buf);
 	return -errno;
 }
 
@@ -98,6 +101,7 @@ static int passthrough_readlink(const char *path, char *buf, size_t size)
 	ssize_t length = readlink(abs_path, buf, size - 1);
 	if (length < 0) return -errno;
 	buf[length] = '\0';
+	fprintf(stderr, "readlink(%s, %s, %ld)\n", path, buf, size);
 	return 0;
 }
 
@@ -110,6 +114,7 @@ static int passthrough_mkdir(const char *path, mode_t mode)
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "mkdir(%s, %p)\n", path, (void *)(&mode));
 	return mkdir(abs_path, mode) < 0 ? -errno : 0;
 }
 
@@ -121,6 +126,7 @@ static int passthrough_rmdir(const char *path)
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "rmdir(%s)\n", path);
 	return rmdir(abs_path) < 0 ? -errno : 0;
 }
 
@@ -133,6 +139,7 @@ static int passthrough_create(const char *path, mode_t mode,
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "create(%s, %p)\n", path, (void *)(&mode));
 	//NOTE: fi->flags already contains the right set of flags to pass to open()
 	return open(abs_path, fi->flags, mode) < 0 ? -errno : 0;
 }
@@ -145,6 +152,7 @@ static int passthrough_unlink(const char *path)
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "unlink(%s)\n", path);
 	return unlink(abs_path) < 0 ? -errno : 0;
 }
 
@@ -160,6 +168,7 @@ static int passthrough_rename(const char *from, const char *to)
 		return -ENAMETOOLONG;
 	}
 
+	fprintf(stderr, "rename(%s, %s)\n", from, to);
 	return rename(from_abs_path, to_abs_path) < 0 ? -errno : 0;
 }
 
@@ -172,6 +181,7 @@ static int passthrough_utimens(const char *path, const struct timespec times[2])
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "utimens(%s, %p)\n", path, (void *)(&times));
 	//NOTE: FUSE doesn't expect this function to follow symlinks
 	return utimensat(AT_FDCWD, abs_path, times, AT_SYMLINK_NOFOLLOW) < 0 ? -errno : 0;
 }
@@ -184,6 +194,7 @@ static int passthrough_truncate(const char *path, off_t size)
 	char abs_path[PATH_MAX];
 	if (!get_path(abs_path, sizeof(abs_path), path)) return -ENAMETOOLONG;
 
+	fprintf(stderr, "truncate(%s, %ld)\n", path, size);
 	return truncate(abs_path, size) < 0 ? -errno : 0;
 }
 
@@ -203,7 +214,9 @@ static int passthrough_read(const char *path, char *buf, size_t size,
 	if (fd < 0) return -errno;
 
 	ssize_t result = pread(fd, buf, size, offset);
+
 	close(fd);
+	fprintf(stderr, "read(%s, %s, %ld, %ld)\n", path, buf, size, offset);
 	return result;
 }
 
@@ -223,6 +236,7 @@ static int passthrough_write(const char *path, const char *buf, size_t size,
 
 	ssize_t result = pwrite(fd, buf, size, offset);
 	close(fd);
+	fprintf(stderr, "write(%s, %s, %ld, %ld)\n", path, buf, size, offset);
 	return result;
 }
 

@@ -65,15 +65,40 @@ void populate_fs( FILE *fp) {
  *   - The path is not an absolute path
  *   - An element on the path cannot be found
  */
+int find_entry_inode(struct dir_entry *directory, char *entry_name){
+    int inode_number = -1;
+    for(int i = 0; i < MAX_DIRS; i ++){
+        struct dir_entry dir_entry = directory[i];
+        if (strcmp(dir_entry.name, entry_name) == 0){
+            inode_number = dir_entry.inode;
+            break;
+        }
+    }
+    return inode_number;
+}
 int path_lookup(char *path) {
     if(path[0] != '/') {
         fprintf(stderr, "Not an absolute path\n");
         return -1;
     } 
 
-	// TODO: complete this function and any helper functions
+    char pathstring[MAXPATH];
+    strncpy(pathstring, path, MAXPATH - 1);
+    pathstring[MAXPATH - 1] = '\0';
+    int inode_number = 0; //start at root inode
 
-    return -1;
+    char *component = strtok(pathstring, "/");
+    while(component != NULL){
+        struct inode dir_inode = itable[inode_number];
+        
+        if((inode_number = find_entry_inode(blocks[dir_inode.block_no], component)) == -1){
+           return -1;
+        }
+
+        component = strtok(NULL, "/");
+    }
+    return inode_number;
+
 }
 
 

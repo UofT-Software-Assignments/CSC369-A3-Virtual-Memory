@@ -52,27 +52,35 @@ void print_and_clear_scores() {
 	int i; 
 	int sum = 0;
 	printf("Scores:\n");
-	for(i = 0; i < PLAYERS; i++) {
+	for(i = 0; i < players; i++) {
 		printf("%d ", scores[i]);
 		sum += scores[i];
 		scores[i] = 0;
 	}
 	printf(" SUM= %d\n", sum);
 }
+
 void eat(int id){ 
 	pthread_mutex_lock(&region_mutex);
 	// If the marbles are all gone then wait for the game to restart
 	// TODO Need another condition if there will be no more rounds
-	while(marbles == 0) {
+	while(marbles == 0 && rounds > 0) {
 		pthread_cond_wait(&out_of_marbles, &region_mutex);
 	}
 	// TODO Need a way to return if there are no more rounds (remember to unlock)
-	
+	if(rounds == 0){
+		pthread_mutex_unlock(&region_mutex);
+		return;
+	}
 	// Take turn
 	marbles--;
 	scores[id]++;
 	// TODO
+	if(marbles == 0){
+		pthread_cond_signal(&done_game);
+	}
 
+	pthread_cond_signal(&out_of_marbles);
 	pthread_mutex_unlock(&region_mutex);
 }
 
@@ -80,11 +88,18 @@ void restart_game() {
 
 	pthread_mutex_lock(&region_mutex);
 	// TODO
+	
+	
+	pthread_cond_signal(&out_of_marbles);
+	while(marbles > 0){
+		pthread_cond_wait(&done_game, &region_mutex);
+	}
 
 	print_and_clear_scores();
 	marbles = total_marbles;
 
 	// TODO
+	pthread_cond_broadcast(&out_of_marbles);
 	pthread_mutex_unlock(&region_mutex);
 }
 
@@ -119,13 +134,16 @@ void *referee(void *id_ptr) {
 		rounds--;
 	}
 	// TODO
+	
+	pthread_cond_broadcast(&out_of_marbles);
+	
     fprintf(stderr, "referee exiting\n");
 	return NULL;
 }
 
 int main(int argc, char **argv) {
 
-    if(argc != 1 || argc != 4) {
+    if(argc != 1 && argc != 4) {
         fprintf(stderr, "Usage: hippos [players marbles rounds]\n");
         fprintf(stderr, "      (With no arguments, use default values)\n");
         exit(1);

@@ -29,6 +29,18 @@
 #include "ring_buffer.h"
 
 
+//linked list entry, represents a thread waiting for an event in events to occur
+typedef struct waiting_thread{
+	cond_t is_ready; //this thread will wait until signaled that it is ready with events to report
+	mutex_t poll_mutex; //threads editing the queue and this polling thread must aquire this lock 
+} waiting_thread;
+
+typedef struct waiting_thread_entry{
+	waiting_thread *wt;
+	int events;
+	list_entry entry;
+} waiting_thread_entry;
+
 // Message queue implementation backend
 typedef struct mq_backend {
 	// Ring buffer for storing the messages
@@ -51,7 +63,16 @@ typedef struct mq_backend {
 
 	//TODO: add necessary synchronization primitives, as well as data structures
 	//      needed to implement the msg_queue_poll() functionality
+	
+	mutex_t queue_mutex;
+	cond_t empty;
+	cond_t no_space;
 
+	//bitwise OR of MQ_POLL_* constants that are true for this queue
+	int qevents;
+
+	list_head wait_queue;
+	
 } mq_backend;
 
 
@@ -70,6 +91,10 @@ static int mq_init(mq_backend *mq, size_t capacity)
 	mq->no_writers = false;
 
 	//TODO: initialize remaining fields (synchronization primitives, etc.)
+	mutex_init(&mq->queue_mutex);
+	cond_init(&mq->empty);
+	cond_init(&mq->no_space);
+	list_init(&mq->wait_queue);
 
 	return 0;
 }
@@ -83,10 +108,15 @@ static void mq_destroy(mq_backend *mq)
 	ring_buffer_destroy(&mq->buffer);
 
 	//TODO: cleanup remaining fields (synchronization primitives, etc.)
+	mutex_destroy(&mq->queue_mutex);
+	cond_destroy(&mq->empty);
+	cond_destroy(&mq->no_space);
+	list_destroy(&mq->wait_queue);
 }
 
 
 #define ALL_FLAGS (MSG_QUEUE_READER | MSG_QUEUE_WRITER | MSG_QUEUE_NONBLOCK)
+
 
 // Message queue handle is a combination of the pointer to the queue backend and
 // the handle flags. The pointer is always aligned on 8 bytes - its 3 least
@@ -201,9 +231,10 @@ msg_queue_t msg_queue_open(msg_queue_t queue, int flags)
 
 	//TODO: add necessary synchronization
 
+	mutex_lock(&mq->queue_mutex);
 	msg_queue_t new_handle = mq_open(mq, flags);
-
-	return new_handle;
+	mutex_unlock(&mq->queue_mutex);
+	return new_handle;	
 }
 
 int msg_queue_close(msg_queue_t *queue)
@@ -215,52 +246,278 @@ int msg_queue_close(msg_queue_t *queue)
 	}
 
 	mq_backend *mq = get_backend(*queue);
-
+	
 	//TODO: add necessary synchronization
+	mutex_lock(&mq->queue_mutex);
 
 	if (mq_close(mq, get_flags(*queue))) {
 		// Closed last handle; destroy the queue
+		mutex_unlock(&mq->queue_mutex);
 		mq_destroy(mq);
 		free(mq);
 		*queue = MSG_QUEUE_NULL;
 		return 0;
 	}
 
+	
+
 	//TODO: if this is the last reader (or writer) handle, notify all the writer
 	//      (or reader) threads currently blocked in msg_queue_write() (or
 	//      msg_queue_read()) and msg_queue_poll() calls for this queue.
+	if(mq->no_readers){
+		mq->qevents = mq->qevents | MQPOLL_WRITABLE | MQPOLL_NOREADERS;
+		cond_broadcast(&mq->no_space); 
+
+	}
+	if(mq->no_writers){
+		mq->qevents = mq->qevents | MQPOLL_READABLE | MQPOLL_NOWRITERS;
+		cond_broadcast(&mq->empty); 
+		
+	}
+	mutex_unlock(&mq->queue_mutex);
 
 	*queue = MSG_QUEUE_NULL;
 	return 0;
 }
 
 
+void trigger_event(msg_queue_t queue, int events){
+	mq_backend *mq = get_backend(queue);
+	mq->qevents = mq->qevents | events;
+	list_entry *pos;
+	list_for_each(pos, &mq->wait_queue){
+		waiting_thread_entry *wt_entry = container_of(pos, waiting_thread_entry, entry);
+		if(wt_entry->events & mq->qevents){ //requested event flag for this thread is true right now
+			mutex_lock(&wt_entry->wt->poll_mutex);
+			//signal waiting thread can report and return
+			cond_signal(&wt_entry->wt->is_ready); 
+			//give up lock shared with waiting thread so it can continue, wait until thread is done 
+			//so queue state is preserved
+			mutex_unlock(&wt_entry->wt->poll_mutex);
+			//cond_wait(&wt_entry->wt->is_done, &wt_entry->wt->poll_mutex); 
+			//mutex_unlock(&wt_entry->wt->poll_mutex); //done with this mutex at this point
+			//mutex_destroy(&wt_entry->wt->poll_mutex);
+		}
+	}
+	
+}
+
 ssize_t msg_queue_read(msg_queue_t queue, void *buffer, size_t length)
 {
-	//TODO
-	(void)queue;
-	(void)buffer;
-	(void)length;
-	errno = ENOSYS;
-	return -1;
+	
+	if(!(get_flags(queue) & MSG_QUEUE_READER)){
+		errno = EBADF;
+		report_error("msg_queue_read"); 
+		return -1;
+	}
+
+	mq_backend *mq = get_backend(queue);
+	mutex_lock(&mq->queue_mutex); 
+	//wait while ring buffer is empty and there are writers yet to be closed
+	while(ring_buffer_used(&mq->buffer) == 0 && !mq->no_writers){
+		if(get_flags(queue) & MSG_QUEUE_NONBLOCK){
+			errno = EAGAIN;
+			report_info("msg_queue_read");
+			mutex_unlock(&mq->queue_mutex); 
+			return -1;
+		}
+		cond_wait(&mq->empty, &mq->queue_mutex);
+	}
+
+	//if empty and no writers, return with 0
+	if(ring_buffer_used(&mq->buffer) == 0 && mq->no_writers){
+		trigger_event(queue, MQPOLL_NOWRITERS);
+		mutex_unlock(&mq->queue_mutex);
+		return 0;
+	}
+
+	//queue is non empty, can read
+	size_t msg_size;
+	ring_buffer_peek(&mq->buffer, &msg_size, sizeof(size_t));
+	if(length < msg_size){
+		errno = EMSGSIZE;
+		report_info("msg_queue_read");
+		mutex_unlock(&mq->queue_mutex); 
+		return ~msg_size;
+	}
+	ring_buffer_read(&mq->buffer, &msg_size, sizeof(size_t));
+	ring_buffer_read(&mq->buffer, buffer, msg_size);
+	cond_signal(&mq->no_space);
+	//if queue is empty and there are writers, MQPOLL_READABLE is false
+	if(ring_buffer_used(&mq->buffer) == 0 && !mq->no_writers){
+		mq->qevents = mq->qevents & ~MQPOLL_READABLE;
+	}
+	trigger_event(queue, MQPOLL_WRITABLE);
+
+	mutex_unlock(&mq->queue_mutex); 
+	return msg_size;
 }
 
 int msg_queue_write(msg_queue_t queue, const void *buffer, size_t length)
 {
 	//TODO
-	(void)queue;
-	(void)buffer;
-	(void)length;
-	errno = ENOSYS;
-	return -1;
+	
+	if(!(get_flags(queue) & MSG_QUEUE_WRITER)){
+		errno = EBADF;
+		report_error("msg_queue_write");
+		return -1;
+	}
+
+	if(length == 0){
+		errno = EINVAL;
+		report_error("msg_queue_write");
+		return -1;
+	}
+
+	mq_backend *mq = get_backend(queue);
+	mutex_lock(&mq->queue_mutex); 
+
+	if(mq->buffer.size < (length + sizeof(size_t))){
+		errno = EMSGSIZE;
+		report_error("msg_queue_write");
+		mutex_unlock(&mq->queue_mutex); 
+		return -1;
+	}
+
+	while(ring_buffer_free(&mq->buffer) < (length + sizeof(size_t)) && !mq->no_readers){
+		if(get_flags(queue) & MSG_QUEUE_NONBLOCK){
+			errno = EAGAIN;
+			report_info("msg_queue_write");
+			mutex_unlock(&mq->queue_mutex); 
+			return -1;
+		}
+		cond_wait(&mq->no_space, &mq->queue_mutex);
+	}
+
+	
+	if(mq->no_readers){
+		trigger_event(queue, MQPOLL_NOREADERS);
+		errno = EPIPE;
+		report_info("msg_queue_write");
+		mutex_unlock(&mq->queue_mutex); 
+		return -1;
+	}
+	
+
+	ring_buffer_write(&mq->buffer, (const void *)&length, sizeof(size_t));
+	ring_buffer_write(&mq->buffer, buffer, length);
+	cond_signal(&mq->empty);
+
+	//if ring_buffer full and there are still readers MQPOLL_WRITEABLE is false
+	if(ring_buffer_free(&mq->buffer) == 0 && !mq->no_readers){
+		mq->qevents = mq->qevents & ~MQPOLL_WRITABLE;
+	}
+	trigger_event(queue, MQPOLL_READABLE);
+
+	mutex_unlock(&mq->queue_mutex); 
+	return 0;
 }
 
+int report_events(msg_queue_pollfd *fds, size_t nfds){
+	int num_ready = 0;
+	for(unsigned int i = 0; i < nfds; ++i){
+		if(fds[i].queue == MSG_QUEUE_NULL) continue;
+
+		int curr_qevents = get_backend(fds[i].queue)->qevents;
+		//populate revents
+		if((fds[i].revents = curr_qevents & fds[i].events) > 0){
+			num_ready++;
+		}
+	
+		if(get_flags(fds[i].queue) & (MSG_QUEUE_READER | MSG_QUEUE_WRITER)){
+			fds[i].revents = fds[i].revents | (curr_qevents & (MQPOLL_NOWRITERS | MQPOLL_NOREADERS));
+		}
+	}
+	return num_ready;
+}
+
+#define ALLEVENTS (MQPOLL_NOWRITERS | MQPOLL_NOREADERS | MQPOLL_READABLE | MQPOLL_WRITABLE)
 
 int msg_queue_poll(msg_queue_pollfd *fds, size_t nfds)
 {
-	//TODO
-	(void)fds;
-	(void)nfds;
-	errno = ENOSYS;
-	return -1;
+	//======================ARGUMENT VALIDATION===================================
+
+	unsigned int num_null = 0;
+	for(int unsigned i = 0; i < nfds; ++i){
+		//skip null handles, setting revents to 0
+		fds[i].revents = 0; //set to 0
+		if(fds[i].queue == MSG_QUEUE_NULL){
+			num_null++;
+			continue; 
+		} 
+
+		if((fds[i].events & ~ALLEVENTS)														         \
+			|| ((fds[i].events & MQPOLL_READABLE) && !(get_flags(fds[i].queue) & MSG_QUEUE_READER))  \
+			|| ((fds[i].events & MQPOLL_WRITABLE) && !(get_flags(fds[i].queue) & MSG_QUEUE_WRITER))) \
+		{
+			errno = EINVAL;
+			report_error("msg_queue_poll");
+			return -1;
+		}
+		
+	}
+	if(num_null == nfds){ //check if nfds is 0 or if all handles are MSG_QUEUE_NULL
+		errno = EINVAL;
+		report_error("msg_queue_poll");
+		return -1;
+	}
+	//=================================================================================
+	//establish struct representing this thread (conditon variables and mutex)
+	waiting_thread *wt = (waiting_thread *)malloc(sizeof(waiting_thread));
+	//establish thread entry structs to append to the wait queues
+	waiting_thread_entry *wt_entries = (waiting_thread_entry *)malloc(sizeof(waiting_thread_entry) * nfds);
+
+	if(wt == NULL || wt_entries == NULL){
+		report_error("malloc");
+		return -1;
+	}
+
+	cond_init(&wt->is_ready);
+	mutex_init(&wt->poll_mutex);
+	mutex_lock(&wt->poll_mutex);
+	//add thread to waiting queues
+	for(unsigned int i = 0; i < nfds; ++i){
+		if(fds[i].queue != MSG_QUEUE_NULL){
+			wt_entries[i].wt = wt;
+			wt_entries[i].events = fds[i].events;
+
+			mq_backend *mq = get_backend(fds[i].queue);
+			mutex_lock(&mq->queue_mutex);
+			list_entry_init(&wt_entries[i].entry);
+			list_add_tail(&mq->wait_queue, &wt_entries[i].entry);
+			mutex_unlock(&mq->queue_mutex);
+		}
+	}
+	//polling_thread is in wait queues, queues can not make read/write operations while polling thread awake
+
+	int num_ready = report_events(fds, nfds);
+	if(num_ready == 0){
+		cond_wait(&wt->is_ready, &wt->poll_mutex);
+		num_ready = report_events(fds, nfds);
+	}
+	mutex_unlock(&wt->poll_mutex);
+	
+
+	//been notified of event, clean up, report events, and return
+	
+	//remove thread from waiting queues
+	//poll mutex and trigger_event function assures atomicity of this operation,
+	//only one polling thread can be here at one time, since other "ready" polling threads will be waiting for the
+	//queue to give up its own poll mutex, which wont happen until this thread signals on is_done
+	for (unsigned int i = 0; i < nfds; ++i){
+		if(fds[i].queue != MSG_QUEUE_NULL){
+			mq_backend *mq = get_backend(fds[i].queue);
+			mutex_lock(&mq->queue_mutex);
+			list_del(&mq->wait_queue, &wt_entries[i].entry);
+			mutex_unlock(&mq->queue_mutex);
+		}
+	}
+	
+	
+	//signal all queues which are holding their state until this thread returns that they can continue
+	cond_destroy(&wt->is_ready);
+	mutex_unlock(&wt->poll_mutex); //destroy will happen in trigger_event to prevent error
+	free(wt);
+	free(wt_entries);
+	return num_ready;
 }

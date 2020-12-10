@@ -53,6 +53,21 @@ static int allocate_frame(pgtbl_entry_t *p)
 		// All frames were in use, so victim frame must hold some page
 		// Write victim page to swap, if needed, and update pagetable
 		// IMPLEMENTATION NEEDED
+		struct frame victim_frame = coremap[frame];
+
+		if(!(victim_frame.pte->frame & PG_DIRTY)){
+			//page is clean, unmodifies
+			evict_clean_count++;
+		} else {
+			//page dirty, modified
+			int new_swap_off = swap_pageout(frame, victim_frame.pte->swap_off);
+			victim_frame.pte->swap_off = new_swap_off;
+			evict_dirty_count++;
+
+		}
+
+		victim_frame.pte->frame = (victim_frame.pte->frame & ~PG_VALID & ~PG_DIRTY) | PG_ONSWAP;
+
 
 	}
 
@@ -146,31 +161,50 @@ char *find_physpage(addr_t vaddr, char type)
 	pgtbl_entry_t *p = NULL; // pointer to the full page table entry for vaddr
 	unsigned idx = PGDIR_INDEX(vaddr); // get index into page directory
 
-	// To keep compiler happy - remove when you have a real use.
-	(void)idx;
-	(void)type;
-	(void)allocate_frame;
-	(void)init_second_level;
-	(void)init_frame;
 
 	// IMPLEMENTATION NEEDED
+	if(pgdir[idx].pde == 0){
+		pgdir[idx] = init_second_level(); //allocate additional page table 
+	}
 	// Use top-level page directory to get pointer to 2nd-level page table
-
-
+	pgtbl_entry_t *page_table = (pgtbl_entry_t *)(pgdir[idx].pde & PAGE_MASK);
 
 	// Use vaddr to get index into 2nd-level page table and initialize 'p'
-
+	unsigned page_table_idx = PGTBL_INDEX(vaddr);
+	p = &page_table[page_table_idx];
 
 
 	// Check if p is valid or not, on swap or not, and handle appropriately
 	// (Note that the first acess to a page will be marked DIRTY.)
+	if (p->frame & PG_VALID) {
+		hit_count++;
+	} else {
+		miss_count++;
 
+		int frame = allocate_frame(p);
+
+		if(p->frame & PG_ONSWAP){
+			int error = swap_pagein(frame, p->swap_off);
+			assert(error == 0);
+
+			p->frame = frame << PAGE_SHIFT;
+			p->frame = (p->frame & ~PG_DIRTY) | PG_ONSWAP;
+		} else {
+			init_frame(frame, vaddr);
+			p->frame = frame << PAGE_SHIFT;
+			p->frame = p->frame | PG_DIRTY;
+			
+		}
+	}
 
 
 	// Make sure that p is marked valid and referenced. Also mark it
 	// dirty if the access type indicates that the page will be written to.
-
-
+	p->frame = p->frame | PG_VALID | PG_REF;
+	if (type == 'S' || type == 'M') {
+		p->frame = p->frame | PG_DIRTY;
+	}
+	ref_count++;
 
 	// Call replacement algorithm's ref_fcn for this page
 	ref_fcn(p);

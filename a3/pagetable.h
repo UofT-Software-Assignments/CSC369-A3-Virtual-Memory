@@ -16,6 +16,7 @@
 #define __PAGETABLE_H__
 
 #include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -77,10 +78,18 @@ char *find_physpage(addr_t vaddr, char type);
 
 void print_pagedirectory(void);
 
+typedef struct list_entry {
+	int frame;
+	struct list_entry *prev;
+	struct list_entry *next;
+} list_entry_t;
+
+
 struct frame {
 	char in_use;       // True if frame is allocated, False if frame is free
 	pgtbl_entry_t *pte;// Pointer back to pagetable entry (pte) for page
 	                   // stored in this frame
+	list_entry_t *entry; // pointer to the entry with this frame's frame number in lru's linked list 
 };
 
 /* The coremap holds information about physical memory.
